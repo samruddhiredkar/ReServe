@@ -1,5 +1,6 @@
 # ReServe
 Spoilage Clock for surplus food: every item auto-cascades people > discounted sale > animal feed > compost. Live on Firebase.
+Live Demo link :- https://re-serve-beige.vercel.app/
 
 ## Setup
 1. Firebase console: create a project, add a Web app, copy the config into `.env.local` (template: `.env.example`).
