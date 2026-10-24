@@ -1,0 +1,111 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function orgPath(uid) { return /databases/$(database)/documents/orgs/$(uid); }
+    function isRole(r) {
+      return signedIn() && exists(orgPath(request.auth.uid))
+        && get(orgPath(request.auth.uid)).data.role == r;
+    }
+    function myOrg() { return get(orgPath(request.auth.uid)).data; }
+    function validCoords(d) {
+      return d.lat is number && d.lat >= -90 && d.lat <= 90
+          && d.lng is number && d.lng >= -180 && d.lng <= 180;
+    }
+
+    // Cascade stage, mirrored from src/logic.js. Uses SERVER time so clients cannot cheat.
+    // 0 = people, 1 = sale, 2 = animal, 3 = compost, 4 = expired
+    function timeStage(d) {
+      let total = d.shelfH * 3600000;
+      let r = float(d.postedAt.toMillis() + total - request.time.toMillis()) / float(total);
+      return r <= 0 ? 4 : (r <= 0.08 ? 3 : (r <= 0.25 ? 2 : (r <= 0.5 ? 1 : 0)));
+    }
+    function stage(d) {
+      let t = timeStage(d);
+      return (d.get('forced', null) != null && d.forced >= t) ? d.forced : t;
+    }
+    function maxShelf(type) { return type == 'cooked' ? 6 : (type == 'produce' ? 72 : 2160); }
+
+    // Organizations: one doc per account, id == auth uid
+    match /orgs/{uid} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name','role','type','lat','lng','createdAt'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 80
+        && validCoords(request.resource.data)
+        && request.resource.data.createdAt == request.time
+        && ((request.resource.data.role == 'giver' && !('type' in request.resource.data))
+         || (request.resource.data.role == 'receiver'
+             && request.resource.data.get('type', '') in ['ngo','canteen','farm','compost']));
+      // role and type can never be changed after sign-up
+      allow update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','lat','lng'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 80
+        && validCoords(request.resource.data);
+      allow delete: if false;
+    }
+
+    match /items/{itemId} {
+      allow read: if signedIn();
+
+      // Only Givers post, only as themselves, with server-set time and a safety confirmation
+      allow create: if isRole('giver')
+        && request.resource.data.keys().hasOnly(['title','type','kg','shelfH','postedAt','giverId','giverName','lat','lng','forced','safetyConfirmed'])
+        && request.resource.data.giverId == request.auth.uid
+        && request.resource.data.giverName == myOrg().name
+        && request.resource.data.lat == myOrg().lat
+        && request.resource.data.lng == myOrg().lng
+        && request.resource.data.title is string
+        && request.resource.data.title.size() >= 2 && request.resource.data.title.size() <= 120
+        && request.resource.data.type in ['cooked','produce','dry']
+        && request.resource.data.kg is number && request.resource.data.kg > 0 && request.resource.data.kg <= 5000
+        && request.resource.data.shelfH is number && request.resource.data.shelfH >= 0.05
+        && request.resource.data.shelfH <= maxShelf(request.resource.data.type)
+        && request.resource.data.postedAt == request.time
+        && request.resource.data.forced == null
+        && request.resource.data.safetyConfirmed == true;
+
+      // CLAIM: only a Receiver whose type matches the CURRENT cascade stage, and only once
+      allow update: if isRole('receiver')
+        && !('claimedBy' in resource.data)
+        && stage(resource.data) < 4
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['claimedBy','claimStage','claimedAt'])
+        && request.resource.data.claimedBy == request.auth.uid
+        && request.resource.data.claimedAt == request.time
+        && request.resource.data.claimStage == ['people','sale','animal','compost'][stage(resource.data)]
+        && myOrg().get('type', '') == ['ngo','canteen','farm','compost'][stage(resource.data)];
+
+      // OVERRIDE: the posting Giver may pick a route while the item is unclaimed
+      allow update: if isRole('giver')
+        && resource.data.giverId == request.auth.uid
+        && !('claimedBy' in resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['forced'])
+        && (request.resource.data.forced == null || request.resource.data.forced in [0,1,2,3]);
+
+      allow delete: if false;
+    }
+
+    // Mess planner: owned by one Giver. Anyone signed in can vote once per mess.
+    match /mess/{gid} {
+      allow read: if signedIn();
+      allow create, update: if isRole('giver') && request.auth.uid == gid
+        && request.resource.data.keys().hasOnly(['enrolled','history','updatedAt'])
+        && request.resource.data.enrolled is int
+        && request.resource.data.enrolled >= 1 && request.resource.data.enrolled <= 10000
+        && request.resource.data.history is list && request.resource.data.history.size() <= 14
+        && request.resource.data.updatedAt == request.time;
+
+      match /votes/{uid} {
+        allow read: if signedIn();
+        allow create, update: if signedIn() && request.auth.uid == uid
+          && request.resource.data.keys().hasOnly(['choice','at'])
+          && request.resource.data.choice in ['eating','skipping']
+          && request.resource.data.at == request.time;
+        allow delete: if signedIn() && (request.auth.uid == uid || request.auth.uid == gid);
+      }
+    }
+  }
+}
